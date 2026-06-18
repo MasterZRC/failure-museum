@@ -551,6 +551,20 @@ def reset_collection() -> None:
     print("cleared local JSON store")
 
 
+def ensure_seeded() -> None:
+    """Seed demo cards only when the store is empty.
+
+    Used on serverless cold starts (Vercel) where persistence lives in an
+    ephemeral /tmp directory and must be repopulated per fresh instance.
+    """
+    from . import store
+
+    if store.count() > 0:
+        return
+    for raw in SEED_CARDS:
+        save_card(FailureCard(**raw))
+
+
 def main() -> None:
     if "--reset" in sys.argv:
         reset_collection()

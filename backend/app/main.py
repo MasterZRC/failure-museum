@@ -25,6 +25,17 @@ app.include_router(graph.router)
 app.include_router(curator.router)
 
 
+@app.on_event("startup")
+def _ensure_seeded_on_startup() -> None:
+    """Populate demo data on a fresh (e.g. serverless) instance."""
+    try:
+        from .seed_data import ensure_seeded
+
+        ensure_seeded()
+    except Exception:
+        pass
+
+
 @app.get("/api/health")
 def health() -> dict:
     s = get_settings()

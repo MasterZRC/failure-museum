@@ -1,0 +1,8 @@
+fastapi
+pydantic
+pydantic-settings
+python-dotenv
+openai
+jieba
+numpy
+networkx

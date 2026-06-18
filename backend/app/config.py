@@ -1,6 +1,15 @@
+import os
 from functools import lru_cache
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _default_storage_file() -> str:
+    """On Vercel the filesystem is read-only except for /tmp, so persist there."""
+    if os.environ.get("VERCEL"):
+        return "/tmp/failure_museum/cards.json"
+    return "./data/cards.json"
 
 
 class Settings(BaseSettings):
@@ -23,7 +32,7 @@ class Settings(BaseSettings):
     llm_timeout_seconds: float = 90.0
     llm_max_retries: int = 0
 
-    storage_file: str = "./data/cards.json"
+    storage_file: str = Field(default_factory=_default_storage_file)
     collection_name: str = "failure_cards"
 
     @property
