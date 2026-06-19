@@ -10,16 +10,20 @@ Vercel when a Blob store is linked, or pulled locally via ``vercel env pull``).
 When the token is absent, callers transparently fall back to local-file storage,
 so the local dev flow is unchanged.
 
-The actual content GET uses the public blob URL via ``urllib`` so we do not
-depend on a specific SDK download signature; uploads and listing go through the
-official ``vercel`` SDK ``BlobClient``.
+All I/O goes through the official ``vercel`` SDK ``BlobClient``, which reads its
+token from ``BLOB_READ_WRITE_TOKEN`` and handles authenticated downloads for
+private stores (a plain HTTP GET on a private blob URL would 401). The blob
+store may be public or private; we auto-detect which ``access`` mode works and
+remember it.
 """
 from __future__ import annotations
 
 import json
 import os
-import urllib.request
 from typing import Any
+
+# Remembered access mode once we learn which one the store accepts.
+_pref_access: str | None = None
 
 
 def blob_enabled() -> bool:
@@ -34,91 +38,69 @@ def _client():
     return BlobClient()
 
 
-def _iter_blobs(listing: Any):
-    """Yield blob entries from a listing across possible SDK return shapes."""
-    blobs = getattr(listing, "blobs", None)
-    if blobs is None and isinstance(listing, dict):
-        blobs = listing.get("blobs")
-    if blobs is None and isinstance(listing, (list, tuple)):
-        blobs = listing
-    return blobs or []
-
-
-def _attr(obj: Any, name: str) -> Any:
-    if isinstance(obj, dict):
-        return obj.get(name)
-    return getattr(obj, name, None)
-
-
-def _find_url(listing: Any, pathname: str) -> str | None:
-    for blob in _iter_blobs(listing):
-        if _attr(blob, "pathname") == pathname:
-            url = _attr(blob, "url") or _attr(blob, "downloadUrl")
-            if url:
-                return str(url)
-    return None
+def _access_candidates() -> list[str]:
+    if _pref_access is not None:
+        return [_pref_access]
+    # Our linked store is Private; try that first, then fall back to public so
+    # the same code works against a public store in local dev.
+    return ["private", "public"]
 
 
 def read_json(pathname: str) -> dict[str, Any] | None:
     """Return the parsed JSON stored at *pathname*, or ``None`` if missing/unreadable."""
+    global _pref_access
     if not blob_enabled():
         return None
+
+    from vercel.blob import BlobNotFoundError
+
     try:
         with _client() as client:
-            listing = client.list_objects(prefix=pathname)
-            url = _find_url(listing, pathname)
-        if not url:
-            return None
-        with urllib.request.urlopen(url, timeout=10) as resp:  # noqa: S310 (trusted blob URL)
-            raw = resp.read().decode("utf-8")
-        return json.loads(raw)
+            for access in _access_candidates():
+                try:
+                    result = client.get(pathname, access=access, use_cache=False)
+                except BlobNotFoundError:
+                    _pref_access = access
+                    return None
+                except Exception:
+                    continue
+                _pref_access = access
+                content = getattr(result, "content", None)
+                if content is None:
+                    return None
+                return json.loads(content.decode("utf-8"))
     except Exception:
         return None
-
-
-def _put(client: Any, pathname: str, body: bytes) -> None:
-    """Upload *body* to *pathname*, overwriting any existing blob.
-
-    Newer Vercel Blob requires opting into overwrite; older signatures may not
-    accept those kwargs, so we degrade gracefully and, as a last resort, delete
-    then re-upload.
-    """
-    try:
-        client.put(
-            pathname,
-            body,
-            access="public",
-            content_type="application/json",
-            add_random_suffix=False,
-            allow_overwrite=True,
-        )
-        return
-    except TypeError:
-        # SDK signature without overwrite kwargs.
-        pass
-    try:
-        client.put(pathname, body, access="public", content_type="application/json")
-        return
-    except Exception:
-        # Blob may already exist and overwrite is disallowed: delete then re-put.
-        listing = client.list_objects(prefix=pathname)
-        url = _find_url(listing, pathname)
-        if url:
-            try:
-                client.delete([url])
-            except Exception:
-                pass
-        client.put(pathname, body, access="public", content_type="application/json")
+    return None
 
 
 def write_json(pathname: str, obj: Any) -> bool:
     """Persist *obj* as JSON at *pathname*. Returns True on success."""
+    global _pref_access
     if not blob_enabled():
         return False
+
     body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
     try:
         with _client() as client:
-            _put(client, pathname, body)
-        return True
+            last_err: Exception | None = None
+            for access in _access_candidates():
+                try:
+                    client.put(
+                        pathname,
+                        body,
+                        access=access,
+                        content_type="application/json",
+                        add_random_suffix=False,
+                        overwrite=True,
+                    )
+                    _pref_access = access
+                    return True
+                except Exception as err:  # try the other access mode
+                    last_err = err
+                    continue
+            if last_err is not None:
+                raise last_err
+        return False
     except Exception:
         return False
