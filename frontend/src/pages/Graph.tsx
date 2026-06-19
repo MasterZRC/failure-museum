@@ -48,6 +48,7 @@ export default function Graph() {
   const fgRef = useRef<any>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const didFit = useRef(false);
+  const hullsRef = useRef<{ cid: string; hull: Pt[] }[]>([]);
   const [data, setData] = useState<GraphData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -116,6 +117,21 @@ export default function Graph() {
 
   const focusedCluster = activeCluster ?? hoverCluster;
 
+  // Convex hulls are expensive to recompute on every render frame (pan/zoom
+  // also trigger frames). Recompute only when node positions actually move
+  // (simulation ticks / drags) and cache the geometry for the render pass.
+  function recomputeHulls() {
+    const groups: Record<string, Pt[]> = {};
+    (graphData.nodes as FGNode[]).forEach((n) => {
+      if (n.x == null || n.y == null) return;
+      (groups[n.cluster] ||= []).push({ x: n.x, y: n.y });
+    });
+    hullsRef.current = Object.entries(groups).map(([cid, pts]) => ({
+      cid,
+      hull: convexHull(pts),
+    }));
+  }
+
   function nodeActive(n: GraphNode): boolean {
     if (hoverNode) return n.id === hoverNode || !!adjacency[hoverNode]?.has(n.id);
     if (focusedCluster) return n.cluster === focusedCluster;
@@ -182,11 +198,14 @@ export default function Graph() {
               height={dims.h}
               backgroundColor="rgba(0,0,0,0)"
               nodeId="id"
-              cooldownTicks={140}
-              d3AlphaDecay={0.035}
+              cooldownTicks={60}
+              d3AlphaDecay={0.06}
               d3VelocityDecay={0.32}
               warmupTicks={20}
+              onEngineTick={recomputeHulls}
+              onNodeDrag={recomputeHulls}
               onEngineStop={() => {
+                recomputeHulls();
                 if (!didFit.current) {
                   didFit.current = true;
                   fgRef.current?.zoomToFit(600, 70);
@@ -194,16 +213,10 @@ export default function Graph() {
               }}
               onBackgroundClick={clearFocus}
               onRenderFramePre={(ctx: any, globalScale: number) => {
-                // translucent convex hulls behind each cluster
-                const groups: Record<string, Pt[]> = {};
-                (graphData.nodes as FGNode[]).forEach((n) => {
-                  if (n.x == null || n.y == null) return;
-                  (groups[n.cluster] ||= []).push({ x: n.x, y: n.y });
-                });
-                Object.entries(groups).forEach(([cid, pts]) => {
+                // draw cached translucent convex hulls behind each cluster
+                hullsRef.current.forEach(({ cid, hull }) => {
                   const dim = focusedCluster != null && cid !== focusedCluster;
                   const color = clusterColor(cid);
-                  const hull = convexHull(pts);
                   ctx.save();
                   ctx.beginPath();
                   if (hull.length === 1) {

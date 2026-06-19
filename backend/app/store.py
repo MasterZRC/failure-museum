@@ -4,6 +4,7 @@ import math
 from pathlib import Path
 from typing import TypedDict
 
+from . import blob_store
 from .config import get_settings
 from .schemas import FailureCard
 
@@ -20,9 +21,21 @@ def _store_path() -> Path:
     return Path(get_settings().storage_file)
 
 
+def _blob_name() -> str:
+    """Stable Blob pathname for the card collection (e.g. ``cards.json``)."""
+    return _store_path().name
+
+
 def _load_records() -> dict[str, _StoredCard]:
     global _records
     if _records is not None:
+        return _records
+
+    # On Vercel (or locally with a pulled token) persist durably to Blob; the
+    # local filesystem is ephemeral there. Falls back to the JSON file in dev.
+    if blob_store.blob_enabled():
+        raw = blob_store.read_json(_blob_name())
+        _records = {item["card"]["id"]: item for item in (raw or {}).get("cards", [])}
         return _records
 
     path = _store_path()
@@ -37,9 +50,14 @@ def _load_records() -> dict[str, _StoredCard]:
 
 
 def _save_records(records: dict[str, _StoredCard]) -> None:
+    payload = {"cards": list(records.values())}
+
+    if blob_store.blob_enabled():
+        blob_store.write_json(_blob_name(), payload)
+        return
+
     path = _store_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"cards": list(records.values())}
     tmp = path.with_suffix(path.suffix + ".tmp")
     with tmp.open("w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -47,9 +65,14 @@ def _save_records(records: dict[str, _StoredCard]) -> None:
 
 
 def reset() -> None:
-    """Clear local JSON storage and in-process cache."""
+    """Clear card storage and the in-process cache."""
     global _records
     _records = {}
+
+    if blob_store.blob_enabled():
+        blob_store.write_json(_blob_name(), {"cards": []})
+        return
+
     path = _store_path()
     if path.exists():
         path.unlink()

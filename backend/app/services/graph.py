@@ -17,7 +17,7 @@ import math
 from collections import Counter
 from pathlib import Path
 
-from .. import store
+from .. import blob_store, store
 from ..config import get_settings
 from ..llm import chat_json
 from ..schemas import (
@@ -139,11 +139,18 @@ def _cluster(
 # --------------------------------------------------------------------------- #
 # pattern naming (LLM + disk cache)
 # --------------------------------------------------------------------------- #
+_NAME_CACHE_BLOB = "patterns.json"
+_GRAPH_CACHE_BLOB = "graph.json"
+
+
 def _cache_path() -> Path:
     return Path(get_settings().storage_file).parent / "patterns.json"
 
 
 def _load_name_cache() -> dict:
+    if blob_store.blob_enabled():
+        return blob_store.read_json(_NAME_CACHE_BLOB) or {}
+
     path = _cache_path()
     if not path.exists():
         return {}
@@ -155,12 +162,37 @@ def _load_name_cache() -> dict:
 
 
 def _save_name_cache(cache: dict) -> None:
+    if blob_store.blob_enabled():
+        blob_store.write_json(_NAME_CACHE_BLOB, cache)
+        return
+
     path = _cache_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     with tmp.open("w", encoding="utf-8") as f:
         json.dump(cache, f, ensure_ascii=False, indent=2)
     tmp.replace(path)
+
+
+def _load_graph_cache(sig: str) -> GraphData | None:
+    """Return the persisted GraphData if it matches the current collection."""
+    if not blob_store.blob_enabled():
+        return None
+    blob = blob_store.read_json(_GRAPH_CACHE_BLOB)
+    if not blob or blob.get("signature") != sig:
+        return None
+    try:
+        return GraphData.model_validate(blob["data"])
+    except Exception:
+        return None
+
+
+def _save_graph_cache(sig: str, data: GraphData) -> None:
+    if not blob_store.blob_enabled():
+        return
+    blob_store.write_json(
+        _GRAPH_CACHE_BLOB, {"signature": sig, "data": data.model_dump(mode="json")}
+    )
 
 
 def _members_key(card_ids: list[str]) -> str:
@@ -252,6 +284,13 @@ def build_graph_data() -> GraphData:
     if _cache is not None and _cache[0] == sig:
         return _cache[1]
 
+    # On a fresh serverless instance the in-process cache is empty; reuse the
+    # Blob-persisted graph so cold starts don't recompute or re-call the LLM.
+    cached = _load_graph_cache(sig)
+    if cached is not None:
+        _cache = (sig, cached)
+        return cached
+
     pairs = store.list_with_embeddings()
     cards = [c for c, _ in pairs]
     embs = [e for _, e in pairs]
@@ -260,6 +299,7 @@ def build_graph_data() -> GraphData:
     if n == 0:
         data = GraphData(nodes=[], edges=[], patterns=[], llm_used=False)
         _cache = (sig, data)
+        _save_graph_cache(sig, data)
         return data
 
     sim = _sim_matrix(embs)
@@ -332,6 +372,7 @@ def build_graph_data() -> GraphData:
 
     data = GraphData(nodes=nodes, edges=edges, patterns=patterns, llm_used=any_llm)
     _cache = (sig, data)
+    _save_graph_cache(sig, data)
     return data
 
 

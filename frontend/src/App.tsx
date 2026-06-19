@@ -10,11 +10,41 @@ const navItems = [
   { to: "/ingest", label: "录入失败" },
 ];
 
+type ConnStatus = "connecting" | "ok" | "down";
+
 export default function App() {
   const [health, setHealth] = useState<Health | null>(null);
+  const [status, setStatus] = useState<ConnStatus>("connecting");
 
   useEffect(() => {
-    api.health().then(setHealth).catch(() => setHealth(null));
+    let cancelled = false;
+    // The backend is a Vercel serverless function that cold-starts after idle,
+    // so the first probe can fail/time out. Retry with backoff before showing
+    // a hard "disconnected" state.
+    const delays = [0, 1500, 3000, 5000, 8000];
+
+    async function probe() {
+      for (let i = 0; i < delays.length; i++) {
+        if (delays[i]) await new Promise((r) => setTimeout(r, delays[i]));
+        if (cancelled) return;
+        try {
+          const h = await api.health();
+          if (!cancelled) {
+            setHealth(h);
+            setStatus("ok");
+          }
+          return;
+        } catch {
+          // keep retrying
+        }
+      }
+      if (!cancelled) setStatus("down");
+    }
+
+    probe();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   return (
@@ -53,7 +83,7 @@ export default function App() {
           </nav>
 
           <div className="ml-auto flex items-center gap-2 text-xs">
-            {health ? (
+            {status === "ok" && health ? (
               <span
                 className={`px-2.5 py-1 rounded-full border ${
                   health.llm_enabled
@@ -63,6 +93,10 @@ export default function App() {
                 title={`chat: ${health.chat_model} / embed: ${health.embed_model}`}
               >
                 {health.llm_enabled ? "AI 已接入" : "降级模式（未配置 Key）"}
+              </span>
+            ) : status === "connecting" ? (
+              <span className="px-2.5 py-1 rounded-full border border-amber-500/30 text-amber-700 bg-amber-500/10 animate-pulse">
+                连接中…
               </span>
             ) : (
               <span className="px-2.5 py-1 rounded-full border border-red-500/30 text-red-700 bg-red-500/10">
