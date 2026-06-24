@@ -2,7 +2,8 @@ import hashlib
 import json
 import math
 from collections import OrderedDict
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, Iterator
 
 import jieba
 
@@ -119,27 +120,35 @@ def embed_text(text: str) -> list[float]:
     return embed_texts([text])[0]
 
 
-def chat_json(system: str, user: str, temperature: float = 0.2) -> dict[str, Any]:
+def chat_json(
+    system: str, user: str, temperature: float = 0.2, max_tokens: int | None = None
+) -> dict[str, Any]:
     """Call the chat model and parse a JSON object from the response."""
     s = get_settings()
     if not s.llm_enabled:
         raise LLMUnavailable("LLM API key not configured")
     client = _get_chat_client()
-    resp = client.chat.completions.create(
-        model=s.llm_chat_model,
-        messages=[
+    kwargs: dict[str, Any] = {
+        "model": s.llm_chat_model,
+        "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        response_format={"type": "json_object"},
-        temperature=temperature,
-    )
+        "response_format": {"type": "json_object"},
+        "temperature": temperature,
+    }
+    if max_tokens:
+        kwargs["max_tokens"] = max_tokens
+    resp = client.chat.completions.create(**kwargs)
     content = resp.choices[0].message.content or "{}"
     return _safe_json(content)
 
 
 def chat_completion(
-    messages: list[dict], tools: list[dict] | None = None, temperature: float = 0.2
+    messages: list[dict],
+    tools: list[dict] | None = None,
+    temperature: float = 0.2,
+    max_tokens: int | None = None,
 ):
     """Raw chat call that supports tool/function calling for the curator agent.
 
@@ -154,11 +163,83 @@ def chat_completion(
         "messages": messages,
         "temperature": temperature,
     }
+    if max_tokens:
+        kwargs["max_tokens"] = max_tokens
     if tools:
         kwargs["tools"] = tools
         kwargs["tool_choice"] = "auto"
     resp = client.chat.completions.create(**kwargs)
     return resp.choices[0].message
+
+
+def chat_stream(
+    messages: list[dict],
+    tools: list[dict] | None = None,
+    temperature: float = 0.2,
+    max_tokens: int | None = None,
+) -> Iterator[tuple[str, Any]]:
+    """Streaming chat call.
+
+    Yields ``("token", text)`` for each content delta as it arrives, then a final
+    ``("done", message)`` where ``message`` mimics the non-streaming assistant
+    message shape (``.content`` and ``.tool_calls`` with ``.id`` /
+    ``.function.name`` / ``.function.arguments``), so the curator loop can treat
+    it like a normal completion.
+    """
+    s = get_settings()
+    if not s.llm_enabled:
+        raise LLMUnavailable("LLM API key not configured")
+    client = _get_chat_client()
+    kwargs: dict[str, Any] = {
+        "model": s.llm_chat_model,
+        "messages": messages,
+        "temperature": temperature,
+        "stream": True,
+    }
+    if max_tokens:
+        kwargs["max_tokens"] = max_tokens
+    if tools:
+        kwargs["tools"] = tools
+        kwargs["tool_choice"] = "auto"
+
+    content_parts: list[str] = []
+    tool_calls: dict[int, dict[str, str]] = {}
+
+    for chunk in client.chat.completions.create(**kwargs):
+        if not getattr(chunk, "choices", None):
+            continue
+        delta = chunk.choices[0].delta
+        if delta is None:
+            continue
+        text = getattr(delta, "content", None)
+        if text:
+            content_parts.append(text)
+            yield ("token", text)
+        for tc in getattr(delta, "tool_calls", None) or []:
+            idx = tc.index or 0
+            slot = tool_calls.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+            if tc.id:
+                slot["id"] = tc.id
+            fn = getattr(tc, "function", None)
+            if fn is not None:
+                if fn.name:
+                    slot["name"] = fn.name
+                if fn.arguments:
+                    slot["arguments"] += fn.arguments
+
+    assembled_calls = [
+        SimpleNamespace(
+            id=slot["id"],
+            type="function",
+            function=SimpleNamespace(name=slot["name"], arguments=slot["arguments"]),
+        )
+        for _, slot in sorted(tool_calls.items())
+    ]
+    message = SimpleNamespace(
+        content="".join(content_parts),
+        tool_calls=assembled_calls or None,
+    )
+    yield ("done", message)
 
 
 def _safe_json(content: str) -> dict[str, Any]:

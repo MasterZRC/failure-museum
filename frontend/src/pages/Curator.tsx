@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, CuratorMessage, FailureCard } from "../api";
+import { api, CuratorChatResponse, CuratorMessage, FailureCard, streamSSE } from "../api";
 import { Markdown } from "../components/Markdown";
+import { StreamProgress } from "../components/StreamProgress";
 
 interface Turn {
   role: "user" | "assistant";
@@ -9,6 +10,9 @@ interface Turn {
   cited?: string[];
   trace?: string[];
   llm_used?: boolean;
+  streaming?: boolean;
+  progress?: string[];
+  active?: string;
 }
 
 const SUGGESTIONS = [
@@ -40,6 +44,17 @@ export default function Curator() {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
   }, [turns, loading]);
 
+  // Patch the last (assistant) turn in place as stream events arrive.
+  function patchLast(patch: Partial<Turn>) {
+    setTurns((prev) => {
+      if (prev.length === 0) return prev;
+      const copy = [...prev];
+      const i = copy.length - 1;
+      copy[i] = { ...copy[i], ...patch };
+      return copy;
+    });
+  }
+
   async function send(text: string) {
     const q = text.trim();
     if (!q || loading) return;
@@ -48,26 +63,78 @@ export default function Curator() {
       content: t.content,
     }));
     const next = [...history, { role: "user" as const, content: q }];
-    setTurns((prev) => [...prev, { role: "user", content: q }]);
+    setTurns((prev) => [
+      ...prev,
+      { role: "user", content: q },
+      {
+        role: "assistant",
+        content: "",
+        streaming: true,
+        progress: [],
+        active: "馆长正在思考…",
+      },
+    ]);
     setInput("");
     setLoading(true);
     try {
-      const res = await api.curatorChat(next);
-      setTurns((prev) => [
-        ...prev,
+      await streamSSE(
+        "/curator/chat/stream",
+        { messages: next },
         {
-          role: "assistant",
-          content: res.answer,
-          cited: res.cited_card_ids,
-          trace: res.tool_trace,
-          llm_used: res.llm_used,
+          onStatus: (txt) =>
+            setTurns((prev) => {
+              if (prev.length === 0) return prev;
+              const copy = [...prev];
+              const i = copy.length - 1;
+              const t = copy[i];
+              const prevActive = t.active;
+              const progress =
+                prevActive && prevActive !== txt
+                  ? [...(t.progress ?? []), prevActive]
+                  : t.progress ?? [];
+              copy[i] = { ...t, progress, active: txt };
+              return copy;
+            }),
+          onToken: (txt) =>
+            setTurns((prev) => {
+              if (prev.length === 0) return prev;
+              const copy = [...prev];
+              const i = copy.length - 1;
+              copy[i] = {
+                ...copy[i],
+                content: copy[i].content + txt,
+                active: undefined,
+              };
+              return copy;
+            }),
+          onDone: (data) => {
+            const res = data as CuratorChatResponse;
+            patchLast({
+              content: res.answer || "",
+              cited: res.cited_card_ids,
+              trace: res.tool_trace,
+              llm_used: res.llm_used,
+              streaming: false,
+              progress: [],
+              active: undefined,
+            });
+          },
+          onError: (e) =>
+            patchLast({
+              content: `馆长暂时无法回应：${e}`,
+              streaming: false,
+              active: undefined,
+              progress: [],
+            }),
         },
-      ]);
+      );
     } catch (err) {
-      setTurns((prev) => [
-        ...prev,
-        { role: "assistant", content: `馆长暂时无法回应：${String(err)}` },
-      ]);
+      patchLast({
+        content: `馆长暂时无法回应：${String(err)}`,
+        streaming: false,
+        active: undefined,
+        progress: [],
+      });
     } finally {
       setLoading(false);
     }
@@ -121,13 +188,25 @@ export default function Curator() {
                       : "bg-ink-800/70 border border-ink-700 text-gray-200"
                   }`}
                 >
-                  {t.role === "assistant" && t.trace && t.trace.length > 0 && (
-                    <div className="mb-2 text-[11px] text-gray-500">
-                      馆长翻阅了：{t.trace.join("；")}
-                    </div>
-                  )}
+                  {t.role === "assistant" &&
+                    !t.streaming &&
+                    t.trace &&
+                    t.trace.length > 0 && (
+                      <div className="mb-2 text-[11px] text-gray-500">
+                        馆长翻阅了：{t.trace.join("；")}
+                      </div>
+                    )}
+                  {t.role === "assistant" &&
+                    t.streaming &&
+                    ((t.progress && t.progress.length > 0) || t.active) && (
+                      <div className={t.content ? "mb-2" : ""}>
+                        <StreamProgress steps={t.progress} active={t.active} />
+                      </div>
+                    )}
                   {t.role === "assistant" ? (
-                    <Markdown>{t.content}</Markdown>
+                    t.content ? (
+                      <Markdown>{t.content}</Markdown>
+                    ) : null
                   ) : (
                     <div className="whitespace-pre-wrap leading-relaxed text-[15px]">
                       {t.content}
@@ -157,14 +236,6 @@ export default function Curator() {
                 </div>
               </div>
             ))}
-            {loading && (
-              <div className="flex justify-start">
-                <div className="rounded-2xl px-4 py-3 bg-ink-800/70 border border-ink-700 text-gray-400 text-sm flex items-center gap-2">
-                  <span className="h-3.5 w-3.5 rounded-full border-2 border-brass-500/40 border-t-brass-400 animate-spin" />
-                  馆长正在翻阅馆藏…
-                </div>
-              </div>
-            )}
           </div>
         )}
       </div>

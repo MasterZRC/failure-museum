@@ -1,10 +1,13 @@
 import json
+from typing import Any, Iterator
 
 from ..config import get_settings
 from ..llm import chat_json
 from ..schemas import MatchedFailure, RiskAlert, RiskReport, SearchHit
 from .graph import patterns_for_cards
 from .search import semantic_search
+
+REPORT_MAX_TOKENS = 800
 
 NORMALIZE_SYSTEM = """你是需求分析助手。请把用户输入的"新需求"扩展成便于检索历史失败的描述。
 只输出 JSON 对象，全部使用简体中文：
@@ -214,3 +217,79 @@ def risk_check(requirement: str, context: str = "", top_k: int = 5) -> RiskRepor
     report = _fallback_report(requirement, normalized, hits)
     report.systemic_patterns = systemic
     return report
+
+
+def risk_check_events(
+    requirement: str, context: str = "", top_k: int = 5
+) -> Iterator[tuple[str, Any]]:
+    """Streaming variant of :func:`risk_check`.
+
+    Surfaces the no-LLM retrieval result (matched failures + systemic patterns)
+    the instant search finishes, then runs a single LLM call for the report.
+    Yields ``status`` / ``matched`` / ``done`` events for the SSE router.
+    """
+    normalized = _raw_normalized(requirement, context)
+    query_text = normalized["query_text"]
+
+    yield ("status", {"text": "正在检索相似的历史失败…"})
+    hits = semantic_search(query_text, top_k=top_k)
+
+    if not hits:
+        yield (
+            "done",
+            RiskReport(
+                requirement=requirement,
+                normalized=normalized,
+                matched_failures=[],
+                risk_alerts=[],
+                pre_launch_checklist=["失败博物馆暂无相关历史失败，建议补充录入后再次体检。"],
+                questions_to_think=["这是一个全新领域吗？是否有相邻场景的失败可以借鉴？"],
+                llm_used=False,
+            ).model_dump(),
+        )
+        return
+
+    systemic = patterns_for_cards([h.card.id for h in hits])
+
+    # No-LLM preview: matched failures + systemic patterns are ready immediately.
+    matched_preview = [
+        MatchedFailure(
+            id=h.card.id,
+            title=h.card.title,
+            similarity=h.score,
+            why_relevant=h.card.one_line or "场景与关键动作相近",
+        )
+        for h in hits
+    ]
+    yield (
+        "matched",
+        {
+            "matched_failures": [m.model_dump() for m in matched_preview],
+            "systemic_patterns": [s.model_dump() for s in systemic],
+        },
+    )
+
+    settings = get_settings()
+    if settings.llm_enabled:
+        yield ("status", {"text": "正在生成上线前风险体检报告…"})
+        try:
+            user = json.dumps(
+                {
+                    "requirement": requirement,
+                    "context": context,
+                    "normalized": normalized,
+                    "historical_failures": _cards_payload(hits),
+                },
+                ensure_ascii=False,
+            )
+            data = chat_json(RISK_SYSTEM, user, max_tokens=REPORT_MAX_TOKENS)
+            report = _assemble_report(requirement, normalized, data, hits)
+            report.systemic_patterns = systemic
+            yield ("done", report.model_dump())
+            return
+        except Exception:
+            pass
+
+    report = _fallback_report(requirement, normalized, hits)
+    report.systemic_patterns = systemic
+    yield ("done", report.model_dump())

@@ -11,15 +11,17 @@ degrades to a retrieval-only summary so the page still works in the demo.
 from __future__ import annotations
 
 import json
+from typing import Any, Iterator
 
 from .. import store
 from ..config import get_settings
-from ..llm import chat_completion
+from ..llm import chat_completion, chat_stream
 from ..schemas import CuratorChatResponse, CuratorMessage
 from .graph import list_patterns
 from .search import semantic_search
 
-MAX_ITERS = 4
+MAX_ITERS = 2
+ANSWER_MAX_TOKENS = 800
 
 CURATOR_SYSTEM = """你是"失败博物馆"的馆长。你的职责是基于馆藏的"失败卡"，帮助团队复用历史失败、避免重蹈覆辙。
 
@@ -225,3 +227,86 @@ def chat(messages: list[CuratorMessage]) -> CuratorChatResponse:
         )
     except Exception:
         return _fallback(messages)
+
+
+def chat_events(messages: list[CuratorMessage]) -> Iterator[tuple[str, Any]]:
+    """Streaming variant of :func:`chat`.
+
+    Yields ``(event, data)`` tuples consumed by the SSE router:
+      * ``status``: human-readable progress (thinking / each tool call)
+      * ``token``:  a live delta of the final answer
+      * ``done``:   the full ``CuratorChatResponse`` payload
+    """
+    settings = get_settings()
+    if not settings.llm_enabled:
+        yield ("done", _fallback(messages).model_dump())
+        return
+
+    convo: list[dict] = [{"role": "system", "content": CURATOR_SYSTEM}]
+    for m in messages:
+        role = m.role if m.role in ("user", "assistant") else "user"
+        convo.append({"role": role, "content": m.content})
+
+    cited: list[str] = []
+    trace: list[str] = []
+
+    try:
+        yield ("status", {"text": "馆长正在思考…"})
+        for _ in range(MAX_ITERS):
+            assembled = None
+            for kind, data in chat_stream(
+                convo, tools=TOOLS, max_tokens=ANSWER_MAX_TOKENS
+            ):
+                if kind == "token":
+                    yield ("token", {"text": data})
+                else:
+                    assembled = data
+
+            if assembled is None or not getattr(assembled, "tool_calls", None):
+                # No tool calls -> this turn IS the (already streamed) answer.
+                yield (
+                    "done",
+                    {
+                        "answer": assembled.content if assembled else "",
+                        "cited_card_ids": cited[:8],
+                        "tool_trace": trace,
+                        "llm_used": True,
+                    },
+                )
+                return
+
+            convo.append(_serialize_assistant(assembled))
+            for tc in assembled.tool_calls:
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                result, label = _run_tool(tc.function.name, args, cited)
+                trace.append(label)
+                yield ("status", {"text": label})
+                convo.append(
+                    {"role": "tool", "tool_call_id": tc.id, "content": result}
+                )
+
+        # Exhausted tool iterations: ask for a final answer without tools.
+        convo.append(
+            {"role": "user", "content": "请基于以上检索到的资料，直接给出最终回答。"}
+        )
+        yield ("status", {"text": "馆长正在总结…"})
+        assembled = None
+        for kind, data in chat_stream(convo, max_tokens=ANSWER_MAX_TOKENS):
+            if kind == "token":
+                yield ("token", {"text": data})
+            else:
+                assembled = data
+        yield (
+            "done",
+            {
+                "answer": assembled.content if assembled else "",
+                "cited_card_ids": cited[:8],
+                "tool_trace": trace,
+                "llm_used": True,
+            },
+        )
+    except Exception:
+        yield ("done", _fallback(messages).model_dump())

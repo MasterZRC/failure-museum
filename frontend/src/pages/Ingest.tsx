@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { api, FailureCard } from "../api";
-import { Spinner } from "../components/Spinner";
+import { api, FailureCard, streamSSE } from "../api";
+import { StreamProgress } from "../components/StreamProgress";
 
 const SAMPLE = `上周做的拉新红包活动，用户首次绑定手机号就能领 5 元。上线当晚成本就超了预算，发现有人用接码平台批量注册账号来薅，单个设备领了几十次。我们没做设备维度的限制，领取接口也能重复调用。最后紧急下线，加了设备指纹和频控才重新上。`;
 
@@ -63,18 +63,41 @@ export default function Ingest() {
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const [status, setStatus] = useState("");
+  const [steps, setSteps] = useState<string[]>([]);
+  const [rawPreview, setRawPreview] = useState("");
 
   async function generate() {
-    if (!raw.trim()) return;
+    if (!raw.trim() || loading) return;
     setLoading(true);
     setError("");
+    setDraft(null);
+    setStatus("");
+    setSteps([]);
+    setRawPreview("");
     try {
-      const card = await api.ingestDraft(raw, "pasted-text");
-      setDraft(card);
+      await streamSSE(
+        "/cards/ingest/stream",
+        { raw_text: raw, source_type: "pasted-text" },
+        {
+          onStatus: (txt) =>
+            setStatus((prev) => {
+              if (prev && prev !== txt) setSteps((s) => [...s, prev]);
+              return txt;
+            }),
+          onToken: (txt) => setRawPreview((p) => p + txt),
+          onDone: (data) => {
+            setDraft(data as FailureCard);
+            setStatus("");
+          },
+          onError: (msg) => setError(msg),
+        },
+      );
     } catch (err) {
       setError(String(err));
     } finally {
       setLoading(false);
+      setStatus("");
     }
   }
 
@@ -130,16 +153,27 @@ export default function Ingest() {
               填入示例
             </button>
           </div>
-          {loading && <Spinner label="正在结构化…" />}
+          {loading && (
+            <StreamProgress steps={steps} active={status || "正在结构化…"} />
+          )}
           {error && <p className="text-sm text-red-700">{error}</p>}
         </div>
 
         {/* draft editor */}
         <div className="rounded-xl border border-ink-700 bg-ink-800/40 p-5">
           {!draft ? (
-            <p className="text-sm text-gray-500">
-              生成后，结构化草稿会出现在这里，可逐字段编辑确认。
-            </p>
+            loading && rawPreview ? (
+              <div className="space-y-2">
+                <div className="text-xs text-gray-500">草稿生成中…</div>
+                <pre className="max-h-[320px] overflow-auto whitespace-pre-wrap break-words text-xs text-gray-400 font-mono leading-relaxed">
+                  {rawPreview}
+                </pre>
+              </div>
+            ) : (
+              <p className="text-sm text-gray-500">
+                生成后，结构化草稿会出现在这里，可逐字段编辑确认。
+              </p>
+            )
           ) : (
             <div className="space-y-3">
               <Field label="标题" value={draft.title} onChange={(v) => upd({ title: v })} />

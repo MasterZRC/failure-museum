@@ -172,6 +172,87 @@ export const api = {
     }),
 };
 
+export interface SSEHandlers {
+  onStatus?: (text: string) => void;
+  onToken?: (text: string) => void;
+  onMatched?: (data: {
+    matched_failures: MatchedFailure[];
+    systemic_patterns: SystemicPattern[];
+  }) => void;
+  onDone?: (data: unknown) => void;
+  onError?: (err: string) => void;
+}
+
+/**
+ * POST to an SSE endpoint and dispatch parsed `event:`/`data:` frames to the
+ * provided handlers as they arrive. Uses the native fetch stream reader, so no
+ * extra dependency is required.
+ */
+export async function streamSSE(
+  path: string,
+  body: unknown,
+  handlers: SSEHandlers,
+): Promise<void> {
+  const res = await fetch(`${BASE}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok || !res.body) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`${res.status} ${res.statusText}: ${text}`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  const dispatch = (event: string, data: any) => {
+    switch (event) {
+      case "status":
+        handlers.onStatus?.(String(data?.text ?? ""));
+        break;
+      case "token":
+        handlers.onToken?.(String(data?.text ?? ""));
+        break;
+      case "matched":
+        handlers.onMatched?.(data);
+        break;
+      case "done":
+        handlers.onDone?.(data);
+        break;
+      case "error":
+        handlers.onError?.(String(data?.text ?? data ?? "unknown error"));
+        break;
+    }
+  };
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    let sep: number;
+    while ((sep = buffer.indexOf("\n\n")) !== -1) {
+      const frame = buffer.slice(0, sep);
+      buffer = buffer.slice(sep + 2);
+
+      let event = "message";
+      let dataStr = "";
+      for (const line of frame.split("\n")) {
+        if (line.startsWith("event:")) event = line.slice(6).trim();
+        else if (line.startsWith("data:")) dataStr += line.slice(5).trim();
+      }
+      if (!dataStr) continue;
+      try {
+        dispatch(event, JSON.parse(dataStr));
+      } catch {
+        /* ignore malformed frame */
+      }
+    }
+  }
+}
+
 export const CLUSTER_COLORS = [
   "#d8613f",
   "#3f86c4",

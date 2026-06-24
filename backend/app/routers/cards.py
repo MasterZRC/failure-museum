@@ -1,10 +1,12 @@
 from collections import Counter
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 
 from .. import store
 from ..schemas import FailureCard, IngestRequest, Stats
-from ..services.ingest import save_card, structure_card
+from ..services.ingest import save_card, structure_card, structure_card_events
+from ..sse import SSE_HEADERS, sse_event
 
 router = APIRouter(prefix="/api/cards", tags=["cards"])
 
@@ -48,6 +50,21 @@ def ingest_draft(req: IngestRequest) -> FailureCard:
     if not req.raw_text.strip():
         raise HTTPException(status_code=400, detail="raw_text is empty")
     return structure_card(req.raw_text, req.source_type)
+
+
+@router.post("/ingest/stream")
+def ingest_draft_stream(req: IngestRequest) -> StreamingResponse:
+    """Streaming version of /ingest: emits status + live token preview + draft."""
+    if not req.raw_text.strip():
+        raise HTTPException(status_code=400, detail="raw_text is empty")
+
+    def gen():
+        for event, data in structure_card_events(req.raw_text, req.source_type):
+            yield sse_event(event, data)
+
+    return StreamingResponse(
+        gen(), media_type="text/event-stream", headers=SSE_HEADERS
+    )
 
 
 @router.post("", response_model=FailureCard)

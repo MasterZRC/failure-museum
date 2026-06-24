@@ -1,10 +1,13 @@
 import uuid
 from datetime import datetime
+from typing import Any, Iterator
 
 from .. import store
-from ..llm import LLMUnavailable, chat_json, embed_text
+from ..llm import LLMUnavailable, chat_json, chat_stream, _safe_json, embed_text
 from ..config import get_settings
 from ..schemas import FailureCard
+
+INGEST_MAX_TOKENS = 900
 
 INGEST_SYSTEM = """你是"失败博物馆"的失败经验结构化助手。请把用户提供的非结构化失败描述（复盘、群聊、事故记录等）整理成一张结构化"失败卡"，并以 JSON 对象输出。
 
@@ -102,6 +105,50 @@ def structure_card(raw_text: str, source_type: str = "pasted-text") -> FailureCa
     if not card.id:
         card.id = _gen_id()
     return card
+
+
+def _finalize_draft(card: FailureCard, source_type: str) -> FailureCard:
+    card.source_type = source_type
+    card.anonymized = True
+    if not card.id:
+        card.id = _gen_id()
+    return card
+
+
+def structure_card_events(
+    raw_text: str, source_type: str = "pasted-text"
+) -> Iterator[tuple[str, Any]]:
+    """Streaming variant of :func:`structure_card`.
+
+    Yields ``status`` progress, ``token`` deltas of the raw model output (shown
+    as a live "generating" preview so the UI never looks frozen), then ``done``
+    with the parsed draft card.
+    """
+    settings = get_settings()
+    yield ("status", {"text": "正在阅读原始记录…"})
+
+    if not settings.llm_enabled:
+        yield ("done", _finalize_draft(_fallback_card(raw_text), source_type).model_dump())
+        return
+
+    yield ("status", {"text": "正在结构化为失败卡…"})
+    parts: list[str] = []
+    try:
+        for kind, data in chat_stream(
+            [
+                {"role": "system", "content": INGEST_SYSTEM},
+                {"role": "user", "content": raw_text},
+            ],
+            max_tokens=INGEST_MAX_TOKENS,
+        ):
+            if kind == "token":
+                parts.append(data)
+                yield ("token", {"text": data})
+        card = _coerce_card(_safe_json("".join(parts) or "{}"))
+    except Exception:
+        card = _fallback_card(raw_text)
+
+    yield ("done", _finalize_draft(card, source_type).model_dump())
 
 
 def save_card(card: FailureCard) -> FailureCard:
