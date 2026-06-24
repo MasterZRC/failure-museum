@@ -164,7 +164,7 @@ export const api = {
       method: "POST",
       body: JSON.stringify(card),
     }),
-  graph: () => req<GraphData>("/graph"),
+  graph: (llm = true) => req<GraphData>(`/graph?llm=${llm ? 1 : 0}`),
   curatorChat: (messages: CuratorMessage[]) =>
     req<CuratorChatResponse>("/curator/chat", {
       method: "POST",

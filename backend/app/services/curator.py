@@ -94,7 +94,7 @@ def _tool_search(args: dict, cited: list[str]) -> tuple[str, str]:
 
 
 def _tool_patterns(_: dict) -> tuple[str, str]:
-    patterns = list_patterns()
+    patterns = list_patterns(use_llm=False)
     payload = [
         {
             "id": p.id,

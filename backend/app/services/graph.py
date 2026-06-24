@@ -15,6 +15,7 @@ import hashlib
 import json
 import math
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .. import blob_store, store
@@ -41,7 +42,10 @@ PATTERN_SYSTEM = """你是失败博物馆的策展研究员。给定同一聚类
  "systemic_risk": "一句话系统性风险洞察，强调这是反复出现、跨业务域的组织级问题"
 }"""
 
-_cache: tuple[str, GraphData] | None = None
+# (signature, data, fully_named): fully_named is True when every cluster with
+# >=2 members got a non-fallback (LLM / cached) name, so we know whether the
+# cached graph can still be upgraded by a later use_llm=True request.
+_cache: tuple[str, GraphData, bool] | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -215,41 +219,91 @@ def _fallback_name(members: list) -> tuple[str, str, str]:
     return name, principle, risk
 
 
-def _name_pattern(members: list, cache: dict) -> tuple[str, str, str, bool]:
-    key = _members_key([c.id for c in members])
-    if key in cache:
-        c = cache[key]
-        return c.get("name", ""), c.get("principle", ""), c.get("systemic_risk", ""), True
+def _llm_name_members(members: list) -> tuple[str, str, str] | None:
+    """Ask the LLM to name one cluster. Returns None on failure / empty name."""
+    try:
+        payload = json.dumps(
+            [
+                {
+                    "id": c.id,
+                    "title": c.title,
+                    "one_line": c.one_line,
+                    "root_cause": c.root_cause,
+                    "scenario": c.scenario,
+                    "tags": c.tags,
+                }
+                for c in members
+            ],
+            ensure_ascii=False,
+        )
+        data = chat_json(PATTERN_SYSTEM, payload)
+        name = str(data.get("name", "")).strip()
+        principle = str(data.get("principle", "")).strip()
+        risk = str(data.get("systemic_risk", "")).strip()
+        if name:
+            return name, principle, risk
+    except Exception:
+        pass
+    return None
 
-    settings = get_settings()
-    if settings.llm_enabled and len(members) >= 2:
-        try:
-            payload = json.dumps(
-                [
-                    {
-                        "id": c.id,
-                        "title": c.title,
-                        "one_line": c.one_line,
-                        "root_cause": c.root_cause,
-                        "scenario": c.scenario,
-                        "tags": c.tags,
-                    }
-                    for c in members
-                ],
-                ensure_ascii=False,
+
+def _name_clusters(
+    communities: list[list[int]], cards: list, name_cache: dict, do_llm: bool
+) -> tuple[list[tuple[str, str, str, bool]], bool]:
+    """Name every cluster, parallelising the (independent) LLM calls.
+
+    Returns ``(names, fully_named)`` where ``names[i]`` is
+    ``(name, principle, systemic_risk, llm_used)`` aligned to ``communities`` and
+    ``fully_named`` is True only when no cluster with >=2 members fell back to
+    rule-based naming (i.e. the result is worth persisting / not re-upgrading).
+    """
+    members_by_idx = [[cards[m] for m in idxs] for idxs in communities]
+    keys = [_members_key([c.id for c in members]) for members in members_by_idx]
+
+    results: list[tuple[str, str, str, bool] | None] = [None] * len(communities)
+
+    # 1) instant cache hits
+    for i, key in enumerate(keys):
+        cached = name_cache.get(key)
+        if cached is not None:
+            results[i] = (
+                cached.get("name", ""),
+                cached.get("principle", ""),
+                cached.get("systemic_risk", ""),
+                True,
             )
-            data = chat_json(PATTERN_SYSTEM, payload)
-            name = str(data.get("name", "")).strip()
-            principle = str(data.get("principle", "")).strip()
-            risk = str(data.get("systemic_risk", "")).strip()
-            if name:
-                cache[key] = {"name": name, "principle": principle, "systemic_risk": risk}
-                return name, principle, risk, True
-        except Exception:
-            pass
 
-    name, principle, risk = _fallback_name(members)
-    return name, principle, risk, False
+    # 2) clusters still missing a name and eligible for LLM naming (>=2 members)
+    missing = [
+        i
+        for i in range(len(communities))
+        if results[i] is None and len(members_by_idx[i]) >= 2
+    ]
+
+    if do_llm and missing and get_settings().llm_enabled:
+        with ThreadPoolExecutor(max_workers=min(len(missing), 6)) as pool:
+            llm_out = list(pool.map(lambda i: _llm_name_members(members_by_idx[i]), missing))
+        for i, out in zip(missing, llm_out):
+            if out is not None:
+                name, principle, risk = out
+                name_cache[keys[i]] = {
+                    "name": name,
+                    "principle": principle,
+                    "systemic_risk": risk,
+                }
+                results[i] = (name, principle, risk, True)
+
+    # 3) anything still unnamed -> rule-based fallback (not written to cache so a
+    #    later use_llm=True pass can still upgrade it)
+    fully_named = True
+    for i, members in enumerate(members_by_idx):
+        if results[i] is None:
+            name, principle, risk = _fallback_name(members)
+            results[i] = (name, principle, risk, False)
+            if len(members) >= 2:
+                fully_named = False
+
+    return [r for r in results if r is not None], fully_named
 
 
 # --------------------------------------------------------------------------- #
@@ -277,18 +331,29 @@ def _severity_max(members: list) -> str:
 # --------------------------------------------------------------------------- #
 # public API
 # --------------------------------------------------------------------------- #
-def build_graph_data() -> GraphData:
-    """Build (and memoize) the full failure graph for the current collection."""
+def build_graph_data(use_llm: bool = True) -> GraphData:
+    """Build (and memoize) the full failure graph for the current collection.
+
+    When ``use_llm`` is False (hot paths: risk-check, curator, gallery count,
+    card detail) cluster naming never blocks on the LLM -- it returns instantly
+    with cached LLM names where available and rule-based fallbacks otherwise.
+    Only the graph page calls with ``use_llm=True`` to (re)generate and persist
+    the LLM names, after which every path shares the upgraded result.
+    """
     global _cache
     sig = store.signature()
     if _cache is not None and _cache[0] == sig:
-        return _cache[1]
+        cached_data, fully_named = _cache[1], _cache[2]
+        # Serve the in-process cache unless the caller wants LLM names and the
+        # cached graph is still only fallback-named (i.e. can be upgraded).
+        if fully_named or not use_llm:
+            return cached_data
 
     # On a fresh serverless instance the in-process cache is empty; reuse the
     # Blob-persisted graph so cold starts don't recompute or re-call the LLM.
     cached = _load_graph_cache(sig)
     if cached is not None:
-        _cache = (sig, cached)
+        _cache = (sig, cached, True)
         return cached
 
     pairs = store.list_with_embeddings()
@@ -298,7 +363,7 @@ def build_graph_data() -> GraphData:
 
     if n == 0:
         data = GraphData(nodes=[], edges=[], patterns=[], llm_used=False)
-        _cache = (sig, data)
+        _cache = (sig, data, True)
         _save_graph_cache(sig, data)
         return data
 
@@ -346,11 +411,12 @@ def build_graph_data() -> GraphData:
 
     name_cache = _load_name_cache()
     cache_size_before = len(name_cache)
-    patterns: list[FailurePattern] = []
+    names, fully_named = _name_clusters(communities, cards, name_cache, use_llm)
     any_llm = False
+    patterns: list[FailurePattern] = []
     for idx, member_idxs in enumerate(communities):
         members = [cards[m] for m in member_idxs]
-        name, principle, risk, llm_used = _name_pattern(members, name_cache)
+        name, principle, risk, llm_used = names[idx]
         any_llm = any_llm or llm_used
         patterns.append(
             FailurePattern(
@@ -371,20 +437,24 @@ def build_graph_data() -> GraphData:
         _save_name_cache(name_cache)
 
     data = GraphData(nodes=nodes, edges=edges, patterns=patterns, llm_used=any_llm)
-    _cache = (sig, data)
-    _save_graph_cache(sig, data)
+    _cache = (sig, data, fully_named)
+    # Only persist a fully-named graph so a fallback-only build never gets frozen
+    # into the Blob cache and blocks future LLM upgrades.
+    if fully_named:
+        _save_graph_cache(sig, data)
     return data
 
 
-def list_patterns() -> list[FailurePattern]:
-    return build_graph_data().patterns
+def list_patterns(use_llm: bool = True) -> list[FailurePattern]:
+    return build_graph_data(use_llm=use_llm).patterns
 
 
 def patterns_for_cards(card_ids: list[str], min_count: int = 2) -> list[SystemicPattern]:
     """Map a set of matched card ids to the recurring patterns they belong to."""
     wanted = set(card_ids)
     out: list[SystemicPattern] = []
-    for p in build_graph_data().patterns:
+    # Hot path (risk-check): never block on LLM cluster naming.
+    for p in build_graph_data(use_llm=False).patterns:
         if p.count < min_count:
             continue
         hit = [cid for cid in p.member_ids if cid in wanted]

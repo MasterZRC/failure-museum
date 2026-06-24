@@ -57,7 +57,7 @@ export default function CardDetail() {
     setPattern(null);
     setSiblings([]);
     api
-      .graph()
+      .graph(false)
       .then((g) => {
         const p = g.patterns.find((x) => x.member_ids.includes(id));
         if (!p) return;

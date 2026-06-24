@@ -26,7 +26,7 @@ export default function Gallery() {
 
   useEffect(() => {
     api
-      .graph()
+      .graph(false)
       .then((g) => setPatternCount(g.patterns.length))
       .catch(() => {});
   }, []);

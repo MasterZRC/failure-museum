@@ -7,10 +7,10 @@ router = APIRouter(prefix="/api/graph", tags=["graph"])
 
 
 @router.get("", response_model=GraphData)
-def graph() -> GraphData:
-    return build_graph_data()
+def graph(llm: bool = True) -> GraphData:
+    return build_graph_data(use_llm=llm)
 
 
 @router.get("/patterns", response_model=list[FailurePattern])
-def patterns() -> list[FailurePattern]:
-    return list_patterns()
+def patterns(llm: bool = True) -> list[FailurePattern]:
+    return list_patterns(use_llm=llm)
